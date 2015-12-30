@@ -3,18 +3,17 @@
 -compile(export_all).
 
 
-get(Pid, Key) ->
-    request(Pid, Key, get).
+request(Pid, Request) ->
+    request(Pid, Request, 200).
 
-put(Pid, Key, Value) ->
-    request(Pid, Key, {put, Value}).
-
-request(Pid, Key, Request) ->
+request(Pid, Request, Timeout) ->
     Ref = make_ref(),
-    Pid ! {request, Pid, self(), Ref, Key, Request},
+    Pid ! {call, self(), Ref, Request},
     receive
-        {response, Pid, Ref, Response} ->
-            Response
+        {reply, Pid, Ref, Response} ->
+            {ok, Response}
+    after Timeout ->
+            {error, timeout}
     end.
 
 
@@ -36,9 +35,13 @@ get_absolute_range(Base, {S, E}) ->
     {get_absolute_nodeid(Base, S), get_absolute_nodeid(Base, E)}.
 
 
+phash(Key) ->
+    erlang:phash2(Key, 16#100000000).
+
+
 add_range(Range, []) ->
     [Range];
-add_range(Range = {_, End}, Ranges = [{Start, _}|_])
+add_range(Range = {_, End}, Ranges=[{Start, _}|_])
   when End < Start ->
     [Range|Ranges];
 add_range(Range = {Start, _}, [H={_, End}|T])
@@ -49,7 +52,7 @@ add_range({S1, E1}, [{S2, E2}|Ranges]) ->
 
 del_range(_, []) ->
     [];
-del_range({_, End}, Ranges = [{Start, _}|_])
+del_range({_, End}, Ranges=[{Start, _}|_])
   when End < Start ->
     Ranges;
 del_range({Start, _}=Range, [H={_, End}|T])
@@ -84,15 +87,19 @@ bootstrap(Controller, NodeID) ->
                   [{get_relative_nodeid(NodeID, ID), Pid}
                    || {ID, Pid} <- Nodes,
                       ID =/= NodeID]),
-            {PrevID, _} = Prev = lists:last(Peers),
-            Replicas = lists:sublist(Peers, 2),
-            Coordinates = PrevID,
-            {StartId, _} = lists:nth(length(Peers) - 2, Peers),
-            Stores = StartId,
-
-            report(NodeID, Coordinates, Stores, []),
-
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, [], dict:new(), new_data())
+            {Stores, _} = lists:nth(length(Peers) - 2, Peers),
+            State =
+                #{ nodeid      => NodeID,
+                   peers       => Peers,
+                   prev        => lists:last(Peers),
+                   replicas    => lists:sublist(Peers, 2),
+                   stores      => Stores,
+                   dropped     => [],
+                   copying     => dict:new(),
+                   data        => new_data()
+                 },
+            report(State),
+            ?MODULE:loop(State)
     end.
 
 
@@ -111,250 +118,253 @@ join(PeerPid, NodeID) ->
                   [{get_relative_nodeid(NodeID, ID), Pid}
                    || {ID, Pid} <- Nodes,
                       ID =/= NodeID]),
-            start_notify_node_joined(Peers, NodeID),
+            start_notify_node_joined(Peers, self(), NodeID),
+
             {PrevID, _} = Prev = lists:last(Peers),
-            Replicas = lists:sublist(Peers, 2),
-            Coordinates = PrevID,
-            start_read_from_replicas(lists:sublist(Peers, 3), {Coordinates, 0}, NodeID),
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Coordinates, [], dict:new(), new_data())
+            start_read_from_replicas(lists:sublist(Peers, 3), get_absolute_range(NodeID, {PrevID, 0})),
+
+            State =
+                #{ nodeid      => NodeID,
+                   peers       => Peers,
+                   prev        => Prev,
+                   replicas    => lists:sublist(Peers, 2),
+                   stores      => PrevID,
+                   dropped     => [],
+                   copying     => dict:new(),
+                   data        => new_data()
+                 },
+            report(State),
+            ?MODULE:loop(State)
     end.
 
 
-loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data) ->
-    receive
-        {request, OriginPeer, Client, Ref, Key, Request} = ClientRequest ->
-            Hash = erlang:phash2(Key, 16#100000000),
-            case get_relative_nodeid(NodeID, Hash) of
-                Hash1 when Hash1 >= Coordinates ->
-                    Have = find_entries(Hash, Key, Data),
-                    case Request of
-                        get ->
-                            start_read_entries(OriginPeer, Client, Ref, Key, Have, Replicas),
-                            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data);
-                        {put, Value} ->
-                            Clock = next_clock(Have),
-                            Data1 = add_entry(Hash, Key, {Clock, Value}, Data),
-                            start_write_entry(OriginPeer, Client, Ref, Key, {Clock, Value}, Replicas),
-                            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data1)
-                    end;
-                Hash1 ->
-                    PeerPid = coordinator(Hash1, Peers),
-                    PeerPid ! ClientRequest,
-                    ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data)
-            end;
-        {copy_to_replica_success, Peer, Range} ->
-            case dict:find(Peer, Copying) of
-                {ok, Ranges} ->
-                    case lists:delete(Range, Ranges) of
-                        [] ->
-                            Copying1 = dict:erase(Peer, Copying),
-                            case ordsets:add_element(Peer, Replicas) of
-                                [Peer1, Peer2, Peer3] ->
-                                    start_remove_replica(Peer3, NodeID, {Coordinates, 0}),
-                                    ?MODULE:loop(NodeID, Peers, Prev, [Peer1, Peer2], Coordinates, Stores, Dropped, Copying1, Data);
-                                Replicas1 ->
-                                    ?MODULE:loop(NodeID, Peers, Prev, Replicas1, Coordinates, Stores, Dropped, Copying1, Data)
-                            end;
-                        Ranges1 ->
-                            Copying1 = dict:store(Peer, Ranges1, Copying),
-                            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying1, Data)
-                    end;
-                error ->
-                    ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data)
-            end;
-        {peer_failure, Peer} ->
-            [_,NextReplica|_] = Peers1 = ordsets:del_element(Peer, Peers),
-            start_notify_node_down(Peer, Peers1, NodeID),
-            Replicas1 = ordsets:del_element(Peer, Replicas),
-            Copying1 = dict:erase(Peer, Copying),
-
-            case Peer of
-                Prev = {PrevID, _} ->
-                    {Prev1ID, _}= Prev1 = lists:last(Peers1),
-                    Coordinates1 = Prev1ID,
-                    Replicas2 = lists:sublist(Replicas1, 1),
-                    Copying2 = start_copy_to_replica(NextReplica, {Prev1ID, PrevID}, NodeID, Copying1),
-
-                    report(NodeID, Coordinates1, Stores, Dropped),
-
-                    ?MODULE:loop(NodeID, Peers1, Prev1, Replicas2, Coordinates1, Stores, Dropped, Copying2, Data);
-                _ ->
-                    case Replicas1 of
-                        [_] ->
-                            Copying2 = start_copy_to_replica(NextReplica, {Coordinates, 0}, NodeID, Copying),
-                            ?MODULE:loop(NodeID, Peers1, Prev, Replicas1, Coordinates, Stores, Dropped, Copying2, Data);
-                        _ ->
-                            ?MODULE:loop(NodeID, Peers1, Prev, Replicas1, Coordinates, Stores, Dropped, Copying, Data)
-                    end
-            end;
-        {call, From, Ref, {node_joined, PeerPid, PeerID}} ->
-            From ! {reply, self(), Ref, ok},
-            RelID = get_relative_nodeid(NodeID, PeerID),
-            Peer = {RelID, PeerPid},
-            Peers1 = ordsets:add_element(Peer, Peers),
-
-            Copying1 =
-                case Peers1 of
-                    [{}, Peer|_] ->
-                        start_copy_to_replica(Peer, {Coordinates, 0}, NodeID, Copying);
-                    [Peer|_] ->
-                        start_copy_to_replica(Peer, {Coordinates, 0}, NodeID, Copying);
-                    _ ->
-                        Copying
-            end,
-
-            case lists:last(Peers1) of
-                Peer ->
-                    report(NodeID, RelID, Stores, Dropped),
-                    ?MODULE:loop(NodeID, Peers1, Peer, Replicas, RelID, Stores, Dropped, Copying1, Data);
-                _ ->
-                    ?MODULE:loop(NodeID, Peers1, Prev, Replicas, Coordinates, Stores, Dropped, Copying1, Data)
-            end;
-
-        {call, From, Ref, {node_down, PeerPid, PeerID}} ->
-            From ! {reply, self(), Ref, ok},
-            RelID = get_relative_nodeid(NodeID, PeerID),
-            Peer = {RelID, PeerPid},
-            [_,NextReplica|_] = Peers1 = ordsets:del_element(Peer, Peers),
-            Replicas1 = ordsets:del_element(Peer, Replicas),
-            Copying1 = dict:erase(Peer, Copying),
-
-            case Peer of
-                Prev = {PrevID, _} ->
-                    {Prev1ID, _}= Prev1 = lists:last(Peers1),
-                    Coordinates1 = Prev1ID,
-                    Replicas2 = lists:sublist(Replicas1, 1),
-                    Copying2 = start_copy_to_replica(NextReplica, {Prev1ID, PrevID}, NodeID, Copying1),
-
-                    report(NodeID, Coordinates1, Stores, Dropped),
-
-                    ?MODULE:loop(NodeID, Peers1, Prev1, Replicas2, Coordinates1, Stores, Dropped, Copying2, Data);
-                _ ->
-                    case Replicas1 of
-                        [_] ->
-                            Copying2 = start_copy_to_replica(NextReplica, {Coordinates, 0}, NodeID, Copying),
-                            ?MODULE:loop(NodeID, Peers1, Prev, Replicas1, Coordinates, Stores, Dropped, Copying2, Data);
-                        _ ->
-                            ?MODULE:loop(NodeID, Peers1, Prev, Replicas1, Coordinates, Stores, Dropped, Copying, Data)
-                    end
-            end;
-        {call, From, Ref, get_peers} ->
-            From ! {reply, self(), Ref,
-                    [{get_absolute_nodeid(NodeID, ID), Pid}
-                     || {ID, Pid} <- [{0, self()}|Peers]]},
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data);
-        {call, From, Ref, {put_range, Range}} ->
-            {RangeStart, _} = Range1 = get_relative_range(NodeID, Range),
-            Stores1 =
-                case RangeStart < Stores of
-                    true ->
-                        RangeStart;
-                    false ->
-                        Stores
-                end,
-            From ! {reply, self(), Ref, ok},
-
-            Dropped1 = del_range(Range1, Dropped),
-
-            report(NodeID, Coordinates, Stores1, Dropped1),
-
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores1, Dropped1, Copying, Data);
-        {call, From, Ref, {drop_range, Range}} ->
-            case add_range(get_relative_range(NodeID, Range), Dropped) of
-                [{Stores, RangeEnd}|Dropped1] ->
-                    Stores1 = RangeEnd,
-                    From ! {reply, self(), Ref, ok},
-
-                    report(NodeID, Coordinates, Stores1, Dropped1),
-                    Data1 = drop_entries_in_range(get_absolute_range(NodeID, {Stores, Stores1}), Data),
-
-                    ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores1, Dropped1, Copying, Data1);
-                Dropped1 ->
-                    From ! {reply, self(), Ref, ok},
-
-                    report(NodeID, Coordinates, Stores, Dropped1),
-
-                    ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped1, Copying, Data)
-            end;
-        {call, From, Ref, {read_range, Range}} ->
-            Response = read_entries_in_range(Range, Data),
-            From ! {reply, self(), Ref, Response},
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data);
-        {call, From, Ref, {read, Key}} ->
-            Hash = erlang:phash2(Key, 16#100000000),
-            Entries = find_entries(Hash, Key, Data),
-            From ! {reply, self(), Ref, Entries},
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data);
-        {call, From, Ref, {write, Key, Entries}} ->
-            Hash = erlang:phash2(Key, 16#100000000),
-            Data1 =
-                case get_relative_nodeid(NodeID, Hash) >= Stores of
-                    true ->
-                        From ! {reply, self(), Ref, ok},
-                        lists:foldl(
-                          fun (Entry, Acc) ->
-                                  add_entry(Hash, Key, Entry, Acc)
-                          end,
-                          Data,
-                          Entries);
-                    false ->
-                        From ! {reply, self(), Ref, error}
-                end,
-            ?MODULE:loop(NodeID, Peers, Prev, Replicas, Coordinates, Stores, Dropped, Copying, Data1)
-    end.
+loop(State) ->
+    NextState =
+        receive
+            {call, From, Ref, Request} ->
+                case ?MODULE:handle_call(Request, State) of
+                    {reply, Reply, State1} ->
+                        From ! {reply, self(), Ref, Reply},
+                        State1;
+                    {spawn, Handler, State1} ->
+                        spawn_link(?MODULE, request_handler, [self(), From, Ref, Handler]),
+                        State1
+                end;
+            Info ->
+                ?MODULE:handle_info(Info, State)
+    end,
+    report(State, NextState),
+    ?MODULE:loop(NextState).
 
 
-coordinator(Hash, [{NodeID, Pid}|_])
-  when Hash < NodeID ->
-    Pid;
-coordinator(Hash, [_|Peers]) ->
-    coordinator(Hash, Peers).
-
-
-start_copy_to_replica(Peer, Range, NodeID, Copying) ->
-    Range1 = get_absolute_range(NodeID, Range),
-    spawn_link(?MODULE, copy_to_replica, [self(), Peer, Range1]),
-    dict:append(Peer, Range1, Copying).
-
-copy_to_replica(Self, Peer, Range) ->
-    case call(Self, Peer, {put_range, Range}, 200) of
-        {ok, ok} ->
-            Self ! {copy_to_replica_success, Peer, Range};
+request_handler(Self, Client, Ref, {M, F, A}) ->
+    case apply(M, F, [Self|A]) of
+        {ok, Reply} ->
+            Client ! {reply, Self, Ref, Reply};
         _ ->
             ok
     end.
 
-start_remove_replica(Peer, NodeID, Range) ->
-    spawn_link(?MODULE, remove_replica, [self(), Peer, get_absolute_range(NodeID, Range)]).
-
-remove_replica(Self, Peer, Range) ->
-    call(Self, Peer, {drop_range, Range}, 200).
+forward_request(Self, Peer, Request) ->
+    call(Self, Peer, Request).
 
 
-start_read_from_replicas(Peers, Range, NodeID) ->
-    spawn_link(?MODULE, read_from_replicas, [self(), Peers, get_absolute_range(NodeID, Range)]).
+coordinator(Hash, [{NodeID, _}=Peer|_])
+  when Hash < NodeID ->
+    Peer;
+coordinator(Hash, [_|Peers]) ->
+    coordinator(Hash, Peers).
 
-read_from_replicas(Self, Peers, Range) ->
-    Results = lists:append([E ||  {ok, E} <- multicall(Self, Peers, {read_range, Range}, 200)]),
-    [call(Self, {0, Self}, {write, Key, Entries}, 200) || {Key, Entries} <- Results],
-    remove_replica(Self, lists:last(Peers), Range),
-    ok.
+find_coordinator(Hash, #{nodeid:=NodeID, prev:={PrevID, _}, peers:=Peers}) ->
+    case get_relative_nodeid(NodeID, Hash) of
+        Hash1 when Hash1 >= PrevID ->
+            self;
+        Hash1 ->
+            coordinator(Hash1, Peers)
+    end.
 
-call(Self, {_,Pid}=Peer, Request, Timeout) ->
-    Ref = make_ref(),
-    Pid ! {call, self(), Ref, Request},
-    receive
-        {reply, Pid, Ref, Response} ->
-            {ok, Response}
-    after Timeout ->
-            Self ! {peer_failure, Peer},
-            {error, timeout}
+handle_call({get, Key}=Request, State=#{data:=Data, replicas:=Replicas}) ->
+    Hash = phash(Key),
+    case find_coordinator(Hash, State) of
+        self ->
+            {spawn, {?MODULE, read_entries, [Key, find_entries(Hash, Key, Data), Replicas]}, State};
+        Peer ->
+            {spawn, {?MODULE, forward_request, [Peer, Request]}, State}
+    end;
+handle_call({put, Key, Value}=Request, State=#{data:=Data, replicas:=Replicas}) ->
+    Hash = phash(Key),
+    case find_coordinator(Hash, State) of
+        self ->
+            Entry = {next_clock(find_entries(Hash, Key, Data)), Value},
+            {spawn, {?MODULE, write_entry, [Key, Entry, Replicas]}, State#{data:=add_entry(Hash, Key, Entry, Data)}};
+        Peer ->
+            {spawn, {?MODULE, forward_request, [Peer, Request]}, State}
+    end;
+handle_call({node_joined, PeerPid, PeerID}, State=#{nodeid:=NodeID, peers:=Peers, prev:={PrevID,_}, copying:=Copying, data:=Data}) ->
+    Peer = {get_relative_nodeid(NodeID, PeerID), PeerPid},
+    Peers1 = ordsets:add_element(Peer, Peers),
+
+    Copying1 =
+        case Peers1 of
+            [{}, Peer|_] ->
+                start_copy_to_replica(Peer, get_absolute_range(NodeID, {PrevID, 0}), Copying, Data);
+            [Peer|_] ->
+                start_copy_to_replica(Peer, get_absolute_range(NodeID, {PrevID, 0}), Copying, Data);
+            _ ->
+                Copying
+        end,
+
+    State1 = State#{peers:=Peers1, copying:=Copying1},
+
+    State2 =
+        case lists:last(Peers1) of
+            Peer ->
+                State1#{prev:=Peer};
+            _ ->
+                State1
+        end,
+    {reply, ok, State2};
+handle_call({node_down, PeerPid, PeerID}, State=#{nodeid:=NodeID, peers:=Peers}) ->
+    Peer = {get_relative_nodeid(NodeID, PeerID), PeerPid},
+    {reply, ok, handle_node_down(Peer, State#{peers:=ordsets:del_element(Peer, Peers)})};
+handle_call(get_peers, State=#{nodeid:=NodeID, peers:=Peers}) ->
+    {reply,
+     [{get_absolute_nodeid(NodeID, ID), Pid}
+      || {ID, Pid} <- [{0, self()}|Peers]],
+     State};
+handle_call({put_range, Range}, State=#{nodeid:=NodeID, stores:=Stores, dropped:=Dropped}) ->
+    {RangeStart, _} = Range1 = get_relative_range(NodeID, Range),
+    Stores1 =
+        case RangeStart < Stores of
+            true ->
+                RangeStart;
+            false ->
+                Stores
+        end,
+    {reply, ok, State#{stores:=Stores1, dropped:=del_range(Range1, Dropped)}};
+handle_call({drop_range, Range}, State=#{nodeid:=NodeID, stores:=Stores, dropped:=Dropped, data:=Data}) ->
+    case add_range(get_relative_range(NodeID, Range), Dropped) of
+        [{Stores, Stores1}|Dropped1] ->
+            Data1 = drop_entries_in_range(get_absolute_range(NodeID, {Stores, Stores1}), Data),
+            {reply, ok, State#{stores:=Stores1, dropped:=Dropped1, data:=Data1}};
+        Dropped1 ->
+            {reply, ok, State#{dropped:=Dropped1}}
+    end;
+handle_call({read_range, Range}, State=#{data:=Data}) ->
+    {reply, read_entries_in_range(Range, Data), State};
+handle_call({read, Key}, State=#{data:=Data}) ->
+    {reply, find_entries(phash(Key), Key, Data), State};
+handle_call({write, Key, Entries}, State=#{nodeid:=NodeID, stores:=Stores, data:=Data}) ->
+    Hash = phash(Key),
+    case get_relative_nodeid(NodeID, Hash) >= Stores of
+        false ->
+            {reply, not_found, State};
+        true ->
+            Data1 =
+                lists:foldl(
+                  fun (Entry, Acc) ->
+                          add_entry(Hash, Key, Entry, Acc)
+                  end,
+                  Data,
+                  Entries),
+            {reply, ok, State#{data:=Data1}}
     end.
 
 
-multicall(Self, Peers, Request, Timeout) ->
+handle_info({copy_to_replica_success, Peer, Range}, State=#{nodeid:=NodeID, prev:={PrevID,_}, copying:=Copying, replicas:=Replicas}) ->
+    case dict:find(Peer, Copying) of
+        error ->
+            State;
+        {ok, Ranges} ->
+            case lists:delete(Range, Ranges) of
+                [] ->
+                    State1 = State#{copying:=dict:erase(Peer, Copying)},
+                    case ordsets:add_element(Peer, Replicas) of
+                        [Peer1, Peer2, Peer3] ->
+                            start_remove_replica(Peer3, get_absolute_range(NodeID, {PrevID, 0})),
+                            State1#{replicas:=[Peer1, Peer2]};
+                        Replicas1 ->
+                            State1#{replicas:=Replicas1}
+                    end;
+                Ranges1 ->
+                    State#{copying:=dict:store(Peer, Ranges1, Copying)}
+            end
+    end;
+handle_info({peer_failure, Peer={PeerID, PeerPid}}, State=#{nodeid:=NodeID, peers:=Peers}) ->
+    Peers1 = ordsets:del_element(Peer, Peers),
+    start_notify_node_down(Peers1, PeerPid, get_absolute_nodeid(NodeID, PeerID)),
+    handle_node_down(Peer, State#{peers:=Peers1});
+handle_info(Info, State) ->
+    io:format("Unknown message: ~p~n", [Info]),
+    State.
+
+
+handle_node_down(Peer={PeerID, _}, State=#{prev:=Peer, nodeid:=NodeID, peers:=Peers=[_,NextReplica|_], replicas:=Replicas, copying:=Copying, data:=Data}) ->
+    Replicas1 = lists:sublist(ordsets:del_element(Peer, Replicas), 1),
+    {Prev1ID, _}= Prev1 = lists:last(Peers),
+    Copying1 = start_copy_to_replica(NextReplica, get_absolute_range(NodeID, {Prev1ID, PeerID}), dict:erase(Peer, Copying), Data),
+    State#{prev:=Prev1, replicas:=Replicas1, copying:=Copying1};
+handle_node_down(Peer, State=#{nodeid:=NodeID, peers:=[_,NextReplica|_], prev:={PrevID, _}, replicas:=Replicas, copying:=Copying, data:=Data}) ->
+    Copying1 = dict:erase(Peer, Copying),
+    Copying2 =
+        case ordsets:del_element(Peer, Replicas) of
+            [_] = Replicas1 ->
+                start_copy_to_replica(NextReplica, get_absolute_range(NodeID, {PrevID, 0}), Copying1, Data);
+            Replicas1 ->
+                Copying1
+        end,
+    State#{replicas:=Replicas1, copying:=Copying2}.
+
+
+start_copy_to_replica(Peer, Range, Copying, Data) ->
+    spawn_link(?MODULE, copy_to_replica, [self(), Peer, Range, read_entries_in_range(Range, Data)]),
+    dict:append(Peer, Range, Copying).
+
+copy_to_replica(Self, Peer, Range, Entries) ->
+    case call(Self, Peer, {put_range, Range}) of
+        {ok, ok} ->
+            case lists:all(
+                   fun ({Key, E}) ->
+                           {ok, ok} =:= call(Self, Peer, {write, Key, E})
+                   end,
+                   Entries) of
+                true ->
+                    Self ! {copy_to_replica_success, Peer, Range};
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
+start_remove_replica(Peer, Range) ->
+    spawn_link(?MODULE, remove_replica, [self(), Peer, Range]).
+
+remove_replica(Self, Peer, Range) ->
+    call(Self, Peer, {drop_range, Range}).
+
+start_read_from_replicas(Peers, Range) ->
+    spawn_link(?MODULE, read_from_replicas, [self(), Peers, Range]).
+
+read_from_replicas(Self, Peers, Range) ->
+    Results = lists:append([E ||  {ok, E} <- multicall(Self, Peers, {read_range, Range})]),
+    [call(Self, {0, Self}, {write, Key, Entries}) || {Key, Entries} <- Results],
+    remove_replica(Self, lists:last(Peers), Range),
+    ok.
+
+call(Self, {_,Pid}=Peer, Request) ->
+    Result = request(Pid, Request),
+    case Result of
+        {error, timeout} ->
+            Self ! {peer_failure, Peer};
+        _ ->
+            ok
+    end,
+    Result.
+
+multicall(Self, Peers, Request) ->
     Pids =
-        [ spawn_link(?MODULE, do_call, [self(), Self, Peer, Request, Timeout])
+        [ spawn_link(?MODULE, do_call, [self(), Self, Peer, Request])
           || Peer <- Peers ],
     [receive
          {result, Pid, Result} ->
@@ -362,32 +372,18 @@ multicall(Self, Peers, Request, Timeout) ->
      end
      || Pid <- Pids ].
 
-do_call(Parent, Self, Peer, Request, Timeout) ->
-    Parent ! {result, self(), call(Self, Peer, Request, Timeout)}.
+do_call(Parent, Self, Peer, Request) ->
+    Parent ! {result, self(), call(Self, Peer, Request)}.
 
 
-report(NodeID, Coordiates, Stores, Dropped) ->
-    Stores1 =
-        lists:foldl(
-          fun del_range/2,
-          [{Stores, 0}],
-          Dropped),
-    io:format(
-      "range change~nnode: ~p~ncoordinates: ~p~nstores: ~p~n~n",
-      [ NodeID,
-        get_absolute_range(NodeID, {Coordiates, 0}),
-        [get_absolute_range(NodeID, Range) || Range <- Stores1]
-      ]).
+start_notify_node_joined(Peers, PeerPid, PeerID) ->
+    spawn_link(?MODULE, do_multicall, [self(), Peers, {node_joined, PeerPid, PeerID}]).
 
-
-start_notify_node_joined(Peers, NodeID) ->
-    spawn_link(?MODULE, do_multicall, [self(), Peers, {node_joined, self(), NodeID}]).
-
-start_notify_node_down({PeerID, PeerPid}, Peers, NodeID) ->
-    spawn_link(?MODULE, do_multicall, [self(), Peers, {node_down, PeerPid, get_absolute_nodeid(NodeID, PeerID)}]).
+start_notify_node_down(Peers, PeerPid, PeerID) ->
+    spawn_link(?MODULE, do_multicall, [self(), Peers, {node_down, PeerPid, PeerID}]).
 
 do_multicall(Self, Peers, Request) ->
-    multicall(Self, Peers, Request, 200).
+    multicall(Self, Peers, Request).
 
 
 next_clock([]) ->
@@ -453,7 +449,7 @@ add_entry(Hash, Key, Entry = {Clock, _}, Data) ->
                 dict:update(
                   Key,
                   fun (Entries) ->
-                          [Entry] ++ [E || {C, _} = E <- Entries, not is_earlier(C, Clock)]
+                          [Entry] ++ [E || {C, _} = E <- Entries, C =/= Clock, not is_earlier(C, Clock)]
                   end,
                   [Entry],
                   Dict),
@@ -462,30 +458,34 @@ add_entry(Hash, Key, Entry = {Clock, _}, Data) ->
             gb_trees:enter(Hash, dict:append(Key, Entry, dict:new()), Data)
     end.
 
+read_entries(Self, Key, Have, Replicas) ->
+    Entries = lists:usort(lists:append([E || {ok, E} <- multicall(Self, Replicas, {read, Key})])),
 
-start_read_entries(OriginPeer, Client, Ref, Key, Have, Replicas) ->
-    spawn_link(?MODULE, read_entries, [self(), OriginPeer, Client, Ref, Key, Have, Replicas]).
-
-read_entries(Self, OriginPeer, Client, Ref, Key, Have, Replicas) ->
-    Entries = lists:usort(lists:append([E || {ok, E} <- multicall(Self, Replicas, {read, Key}, 200)])),
-
-    Others = [Entry || Entry = {Clock, _} <- Entries, not lists:any(fun ({C,_}) when C =:= Clock -> true; ({C,_}) ->  is_earlier(Clock, C) end, Have)],
+    Others =
+        [ Entry
+          || Entry = {Clock, _} <- Entries,
+             not lists:any(
+                   fun ({C,_})
+                         when C =:= Clock
+                              ->
+                           true;
+                       ({C,_}) ->
+                           is_earlier(Clock, C)
+                   end,
+                   Have)],
 
     case Others of
         [] ->
             ok;
         _ ->
-            call(Self, {0, Self}, {write, Key, Others}, 200)
+            call(Self, {0, Self}, {write, Key, Others})
     end,
-    Client ! {response, OriginPeer, Ref, lists:usort([V || {_,V} <- Have ++ Others])}.
+    {ok, [V || {_,V} <- Have ++ Others]}.
 
 
-start_write_entry(OriginPeer, Client, Ref, Key, Entry, Replicas) ->
-    spawn_link(?MODULE, write_entry, [self(), OriginPeer, Client, Ref, Key, Entry, Replicas]).
-
-write_entry(Self, OriginPeer, Client, Ref, Key, Entry, Replicas) ->
-    multicall(Self, Replicas, {write, Key, [Entry]}, 200),
-    Client ! {response, OriginPeer, Ref, ok}.
+write_entry(Self, Key, Entry, Replicas) ->
+    multicall(Self, Replicas, {write, Key, [Entry]}),
+    {ok, ok}.
 
 
 read_entries_in_range(Range, Data) ->
@@ -505,3 +505,23 @@ in_range(Hash, {S, E}) when S < E ->
     (Hash >= S) and (Hash < E);
 in_range(Hash, {S, E}) ->
     (Hash >= S) or (Hash < E).
+
+
+
+report(#{nodeid:=NodeID, prev:={PrevID,_}, stores:=Stores, dropped:=Dropped}) ->
+    Stores1 =
+        lists:foldl(
+          fun del_range/2,
+          [{Stores, 0}],
+          Dropped),
+    io:format(
+      "range change~nnode: ~p~ncoordinates: ~p~nstores: ~p~n~n",
+      [ NodeID,
+        get_absolute_range(NodeID, {PrevID, 0}),
+        [get_absolute_range(NodeID, Range) || Range <- Stores1]
+      ]).
+
+report(#{prev:={PrevID,_}, stores:=Stores, dropped:=Dropped}, #{prev:={PrevID,_}, stores:=Stores, dropped:=Dropped}) ->
+    ok;
+report(_, State1) ->
+    report(State1).

@@ -4,11 +4,15 @@
 
 
 get(Key) ->
-    Pid = controller:pick(),
-    node:get(Pid, Key).
-
+    request({get, Key}).
 
 put(Key, Value) ->
-    Pid = controller:pick(),
-    node:put(Pid, Key, Value).
-    
+    request({put, Key, Value}).
+
+request(Request) ->
+    case node:request(controller:pick(), Request) of
+        {ok, Response} ->
+            Response;
+        {error, timeout} ->
+            request(Request)
+    end.
